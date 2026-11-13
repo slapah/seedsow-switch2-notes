@@ -24,6 +24,9 @@ along the way. It contains no firmware, no keys, and no copyrighted content.
   `OpenDataStorageByCurrentProcess` → `IStorage::GetSize` returns a real size.
 - **Result: deterministic, authenticated, blocking filesystem IPC over Seedsow,
   reading real data back.** The transport is complete and HW-proven.
+- The remaining piece is the fs-bug *acquisition* stage (a concurrent-thread
+  race). It now drives end-to-end over the bridge adapter and reaches the final
+  leak phase, but has not completed in recent runs (see "Acquisition status").
 
 ---
 
@@ -267,18 +270,98 @@ staggered sleeps.
 
 ---
 
-## Where it stands / what's left
+## Two targets, host-specific constants
+
+The same installed title is reachable two ways on the same nnSdk 23.0.1 — the
+embedded-Lua (Seedsow/nora) path and the chat-XSS (CivSwitch) path — and the
+validated engine now supports both as explicit targets. Two constants differ per
+host and must be set correctly or acquisition never advances:
+
+- **Pin-allocation cost:** the re-roll loop requires the pin allocation cost to
+  equal a per-host value. Lua/Seedsow host = **7440 bytes**; the chat-XSS host =
+  **6960**. A mismatch stalls the race indefinitely (the pin-cost gate never
+  passes) while every other signal looks fine.
+- **Content mount name:** the engine historically hardcoded `rom`; the Lua host
+  mounts content as `game`. The mount-name is now resolved from config so the
+  race can actually start on either host.
+
+Positive-fill segmentation also matters: a single unbroken positive-wave filler
+is rejected by the save backend before the alias reaches the canary; segmenting
+it (e.g. 63) lets the overwrite primitive qualify.
+
+## Driving the whole engine over the Lua entry (bridge adapter)
+
+Rather than re-port ~1200 lines of acquisition logic, the Lua entry hosts a small
+RPC bridge that speaks the engine's existing bridge contract: the console
+*listens*, the PC-side engine connects *in* (the Lua primitive has
+bind/listen/accept but no `connect`). The engine's record-A/record-B calls map to
+`call_deep`; reads/writes/queries map to native `memmove`/`svcQueryMemory`. With
+this, the entire validated engine runs over the Lua entry.
+
+Gotchas that cost real time:
+- **`poke`/`write_bytes` spill forward at 16-misaligned 8-byte slots** — writing a
+  result header at a 16-misaligned offset silently corrupted the adjacent field,
+  producing a bogus `query().address` and a spurious "SDK mapping differs" at
+  qualify. Fix: write the 16-byte result header via native `memmove` (copies
+  exactly N bytes, no spill).
+- **Blocking accept wedges the single-threaded `/eval` server** if the PC doesn't
+  connect promptly — use non-blocking accept (`fcntl O_NONBLOCK`) + a bounded
+  poll that returns, so a failed run never wedges the entry.
+- The bridge is **~10× slower over the Lua entry** (~20 s/wave) than the native
+  chat-XSS transport (~2 s/wave), because each RPC parses request fields with
+  ~20 memmove-based reads. Attempts to speed the read path with direct `peek`
+  hard-crashed the console (an unexplained on-device interaction), so the slow
+  read path stands. Acquisition is correct over the bridge — just slow.
+
+## Acquisition status
 
 - **Transport: DONE and HW-proven** — raw-svc threads, multi-call worker frames
   with dynamic args, blocking authenticated fsp-srv IPC with reply parsing, live
   IStorage reads, and proven thread concurrency.
-- **Remaining:** port the fs-bug *acquisition* stage (the reserved-gap race:
-  staggered concurrent worker threads issuing the role IPCs so a canary alloc
-  lands in the freed reservation group during an in-flight large commit), then
-  the standard post-acquisition escalation. That escalation (arbitrary
-  fs-process R/W → chosen-pid re-init → opening system filesystems) is the
-  published method and is a large multi-session assembly; the deterministic
-  channel to drive it is complete.
+- **Over the bridge (Lua entry):** the full chain reaches `app/map` →
+  `inspect-mounts` → **`qualify` (verified)** → the acquisition race, which then
+  grinds through the real profile chain
+  (`abort-control → abort-hole-control → extent-absent → extent-present → …`). At
+  ~20 s/wave it is a long haul to the `cache-*-leak` family where the canary
+  finally lands, and recent runs stop before completing (a later host-specific
+  constant, console degradation over a long run, or simply the clock).
+- **Over the native transport:** the race runs at full speed and reaches the
+  **final `cache-combined-leak` phase (~257 waves)** — the deepest point this
+  line of work has reached — but has been cut short by run-time caps and by the
+  console degrading after a long race (needs a reboot + re-arm between attempts;
+  the overwrite flips reliably only on the first run after a reboot).
+- **Remaining:** finish the acquisition race (concurrent staggered worker threads
+  landing a canary alloc in the freed reservation group during an in-flight large
+  commit), then the standard, published post-acquisition escalation (arbitrary
+  fs-process R/W → chosen-pid re-init → opening system filesystems). The
+  deterministic channel to drive all of it is complete; what's left is winning
+  the race within a single healthy console session.
+
+## fs attack surface (RE direction)
+
+With code-exec in a process that talks to `fs`, the natural next question is where
+the *server-side* (privilege-boundary) bugs are. The nnSdk carries full symbols,
+and the client-side path-handling code is all present and named — the same bug
+class ns2jb abuses:
+
+- `nn::fs::PathNormalizer::Normalize` (the core normalizer)
+- `nn::fs::PathNormalizer::IsParentDirectoryPathReplacementNeeded` (the `..`
+  collapse)
+- `nn::fs::PathFormatter::Normalize` / `IsNormalized`,
+  `nn::fs::Path::InitializeWithNormalization`
+
+Path normalization and `..` handling (off-by-one / length-limit edges /
+embedded-null handling) is the highest-probability neighborhood. But these run in
+the *app's own* process, where code-exec is already held — so client bugs are low
+value except where they reveal a server-trust gap. The real prize is the **`fs`
+sysmodule**, audited against its `fsp-srv` command dispatch (per-handler input
+validation + the cache/reservation-race siblings of the known bug). Note `fs` is
+a **package2 KIP** (kernel-loaded alongside `ldr`/`ncm`/`pm`/`sm`), *not* an
+exefs/NCA title — so it isn't present in a decoded exefs set and has to come from
+the KIP/package2 region specifically.
+
+*(This write-up covers exploitation technique and RE direction only. It contains
+no firmware images, no keys or keysets, and no device-specific material.)*
 
 ### Note on the CivSwitch (chat-XSS) sibling path
 
