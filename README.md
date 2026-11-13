@@ -1,46 +1,43 @@
-# Deterministic filesystem access on Switch 2 (fw 23.0.1) via Civ 7's embedded Lua
+# Deterministic filesystem access on Switch 2 (fw 23.0.1) via Seedsow
 
 Research notes on reaching a working, blocking **fsp-srv** IPC channel — and live
 filesystem reads — on Switch 2 firmware **23.0.1**, using the `nora2hax/seedsow`
-save-file exploit against Civilization 7's embedded Lua engine.
+save-file exploit and the `n2h` Lua code-execution primitive it provides.
 
 This is a technical write-up of an exploitation *path* and the obstacles solved
-along the way. It contains no firmware, no keys, and no copyrighted content.
+along the way. It contains no firmware images, no keys or keysets, and no
+device-specific material.
 
 ---
 
 ## TL;DR
 
-- `nora2hax/seedsow` gives deterministic Lua code execution (`n2h` primitive)
-  inside Civ 7 on fw 23.0.1 — no race, no save-geometry lottery.
-- The historical blocker for both this and the CivSwitch (chat-XSS) path was the
-  same: **no working thread creation / no block-capable execution context**, so a
-  blocking `svcSendSyncRequest` to fsp-srv would hang forever.
+- `nora2hax/seedsow` gives **deterministic** Lua code execution (the `n2h`
+  primitive) on fw 23.0.1 — no race and no save-geometry lottery to get a
+  foothold.
+- The historical blocker was **no working thread creation / no block-capable
+  execution context**: a blocking `svcSendSyncRequest` to fsp-srv would hang
+  forever from the forged `call_deep` context.
 - **That wall is now broken.** Raw-svc kernel threads were brought up and proven
-  on hardware; a real kernel thread *can* block/resume where the forged
-  `call_deep` context cannot.
+  on hardware; a real kernel thread *can* block/resume where the forged context
+  cannot.
 - On a raw-svc thread: `GetServiceHandle("fsp-srv")` → a valid session →
   `SetCurrentProcess` round-trips (`SFCO`, `cmif_result = 0`) →
   `OpenDataStorageByCurrentProcess` → `IStorage::GetSize` returns a real size.
 - **Result: deterministic, authenticated, blocking filesystem IPC over Seedsow,
   reading real data back.** The transport is complete and HW-proven.
 - The remaining piece is the fs-bug *acquisition* stage (a concurrent-thread
-  race). It now drives end-to-end over the bridge adapter and reaches the final
+  race). It now drives end-to-end over a bridge adapter and reaches the final
   leak phase, but has not completed in recent runs (see "Acquisition status").
 
 ---
 
-## Target identification
+## Target
 
-"Seedsow" / codename "Ounce" is **Civilization 7** — the same installed title
-that CivSwitch exploits via chat-XSS. Seedsow instead exploits Civ 7's *embedded
-Lua* (Civ 7's scripts are Lua). Same installed game, same nnSdk build. Proof: the
-longjmp and `svcCreateThread` offsets are identical to the CivSwitch Civ 7 probe.
-
-- Civ 7 mounts (chat-XSS path): `['rom','save','cache']`
-- Seedsow/Lua host mounts: `['game','save']`
-
-Same nnSdk 23.0.1; game-specific details (mount names, allocation costs) differ.
+"Seedsow" (platform codename **"Ounce"**) exposes a game's **embedded Lua**
+engine on nnSdk **23.0.1**. The save-file exploit lands `n2h` Lua code execution
+deterministically inside that process. Mounts visible to the Lua host:
+`['game', 'save']`.
 
 ---
 
@@ -110,14 +107,13 @@ SVC wrappers:
 - `longjmp` +0x5511b4, `memmove` +0x522830
 
 Non-svc gadget offsets (live build): `loadTable` 0x4E094, `call4` 0x359b88,
-`saveResult64` 0x19bcc0, `call4LoadOffset` = 112. (Note: earlier published
-configs list call4 at 0x359BC8 / saveResult64 at 0x19B6C0 — those are stale for
-this build. Verify against the current dump; you can't verify on-device because
-`.text` peeks crash.)
+`saveResult64` 0x19bcc0, `call4LoadOffset` = 112. (Earlier configs list call4 at
+0x359BC8 / saveResult64 at 0x19B6C0 — stale for this build. Verify against the
+current dump; you can't verify on-device because `.text` peeks crash.)
 
 Sockets: socket +0x14d4c0, bind +0x14d3b0, listen +0x14d440, accept +0x14d380,
 recv +0x14d300, send +0x14d350, close +0x14d510, fcntl +0x14d560,
-is_initialized +0x14d930 (Civ 7 already initializes sockets — no
+is_initialized +0x14d930 (sockets are already initialized — no
 `socket_initialize` needed).
 
 ---
@@ -129,19 +125,17 @@ is_initialized +0x14d930 (Civ 7 already initializes sockets — no
 A *valid*, blocking `svcSendSyncRequest` / `WithUserBuffer` never completes from
 any forged context: on the main/HTTP thread (`call_deep` or `run_chain`) it
 blocks and never resumes — the forged ROP/JOP context can't survive a kernel
-block+resume. The normal fix (a worker thread) crashed on hardware. Both the
-Seedsow and CivSwitch paths converged on this single unsolved problem.
+block+resume. The normal fix (a worker thread) crashed on hardware.
 
 ### What did NOT work
 
 - nn::os high-level `CreateThread` out-of-context → deadlocks then crashes (its
   constructors / alias-map / ThreadManager locks don't tolerate a forged entry).
-- The old worker_probe pattern forged a thread with a raw heap stack and called
-  the thread-impl directly, skipping the alias stack — Ryujinx doesn't enforce
-  memory type so it passed in emulation, but real HW `svcCreateThread` rejects a
-  heap stack.
+- Forging a thread with a raw heap stack and calling the thread-impl directly,
+  skipping the alias stack — passes under emulation (no memory-type enforcement),
+  but real HW `svcCreateThread` rejects a heap stack.
 - Blind iteration was the real wall for a while: `/eval` buffers all output, so a
-  crash returns nothing. `n2h.log` goes to the kernel debug log (invisible
+  crash returns nothing, and `n2h.log` goes to the kernel debug log (invisible
   without a HW debugger). Every failed attempt was a silent crash + re-arm.
 
 ### Two unlocks
@@ -151,10 +145,9 @@ Seedsow and CivSwitch paths converged on this single unsolved problem.
    steps 1..N survive; the first bound that returns nothing is the crashing step.
    This turns silent-crash into binary-search localization — no HW debugger
    needed.
-2. **The crashes were the `.text` reads, not the thread logic.** The reference
-   probe scans `.text` for byte-signatures; Seedsow code pages are X-only so any
-   such scan crashes. Porting `.text`-free (using the offline NSO offsets
-   directly) removes the crash.
+2. **The crashes were the `.text` reads, not the thread logic.** Scanning `.text`
+   for byte-signatures crashes (X-only pages). Porting `.text`-free (using the
+   offline NSO offsets directly) removes the crash.
 
 ### HW-proven raw-svc thread technique (Phase A, 3/3 clean)
 
@@ -240,13 +233,14 @@ commands in one session, both round-trip.
 
 - `OpenDataStorageByCurrentProcess` (cmd 200) → reply with a moved **IStorage**
   handle (`w1 = 0x80000008`), `cmif_result = 0`. (`OpenSdCardFileSystem` cmd 18
-  fails `0xbfb20002` = no sdcard permission at Civ 7's own perms, as expected.)
+  fails `0xbfb20002` = no sdcard permission at the process's own perms, as
+  expected.)
 - Two-thread flow: T1 opens the storage, main extracts the IStorage move-handle
   from T1's TLS reply (handle at `TLS+0xc`), T2 sends **`IStorage::GetSize`
   (cmd 4)** to that handle → `cmif_result = 0`, size ≈ 1.7 GB.
 
 So: open a real FS object, get its handle, issue IStorage commands, read real
-data back — all deterministically, over Civ 7's embedded Lua on raw-svc threads.
+data back — all deterministically, over the embedded Lua on raw-svc threads.
 **This is the stated goal: working deterministic filesystem access.**
 
 ---
@@ -258,10 +252,10 @@ sleeping 1 s finish in ~1.1 s total, all join clean, with 4 distinct consecutive
 TLS slots (kernel assigns TLS sequentially, 0x200 apart). This makes the
 reserved-gap "wave" model (≈13 concurrent worker threads) viable.
 
-Pattern for N concurrent threads: build N worker frames, loop
-create+start (no join between), then join each at the end with a generous
-timeout. Timing sync via staggered `svcSleepThread` delays per role (300 µs
-steps dominate the µs-scale create/start skew), or a master-flag futex.
+Pattern for N concurrent threads: build N worker frames, loop create+start (no
+join between), then join each at the end with a generous timeout. Timing sync via
+staggered `svcSleepThread` delays per role (300 µs steps dominate the µs-scale
+create/start skew), or a master-flag futex.
 
 **Master-sync gotcha:** the eq1 wait wrapper expects the address in **x19**, not
 x0; call `svcWaitForAddress` (+0x168d1c) directly with
@@ -270,35 +264,35 @@ staggered sleeps.
 
 ---
 
-## Two targets, host-specific constants
+## Host-specific acquisition constants
 
-The same installed title is reachable two ways on the same nnSdk 23.0.1 — the
-embedded-Lua (Seedsow/nora) path and the chat-XSS (CivSwitch) path — and the
-validated engine now supports both as explicit targets. Two constants differ per
-host and must be set correctly or acquisition never advances:
+Two constants must be set correctly for the acquisition race on this host or it
+never advances:
 
-- **Pin-allocation cost:** the re-roll loop requires the pin allocation cost to
-  equal a per-host value. Lua/Seedsow host = **7440 bytes**; the chat-XSS host =
-  **6960**. A mismatch stalls the race indefinitely (the pin-cost gate never
-  passes) while every other signal looks fine.
-- **Content mount name:** the engine historically hardcoded `rom`; the Lua host
-  mounts content as `game`. The mount-name is now resolved from config so the
-  race can actually start on either host.
+- **Pin-allocation cost = 7440 bytes.** The re-roll loop requires the pin
+  allocation cost to equal this value; a mismatch stalls the race indefinitely
+  (the pin-cost gate never passes) while every other signal looks fine.
+- **Content mount name = `game`.** The engine historically hardcoded `rom`; this
+  host mounts content as `game`, so the mount-name must be resolved from config
+  or the race dies at startup ("required native mounts are missing", 0 waves).
 
 Positive-fill segmentation also matters: a single unbroken positive-wave filler
 is rejected by the save backend before the alias reaches the canary; segmenting
 it (e.g. 63) lets the overwrite primitive qualify.
 
+---
+
 ## Driving the whole engine over the Lua entry (bridge adapter)
 
 Rather than re-port ~1200 lines of acquisition logic, the Lua entry hosts a small
-RPC bridge that speaks the engine's existing bridge contract: the console
-*listens*, the PC-side engine connects *in* (the Lua primitive has
+RPC bridge that speaks the validated engine's existing bridge contract: the
+console *listens*, the PC-side engine connects *in* (the Lua primitive has
 bind/listen/accept but no `connect`). The engine's record-A/record-B calls map to
 `call_deep`; reads/writes/queries map to native `memmove`/`svcQueryMemory`. With
 this, the entire validated engine runs over the Lua entry.
 
 Gotchas that cost real time:
+
 - **`poke`/`write_bytes` spill forward at 16-misaligned 8-byte slots** — writing a
   result header at a 16-misaligned offset silently corrupted the adjacent field,
   producing a bogus `query().address` and a spurious "SDK mapping differs" at
@@ -307,11 +301,13 @@ Gotchas that cost real time:
 - **Blocking accept wedges the single-threaded `/eval` server** if the PC doesn't
   connect promptly — use non-blocking accept (`fcntl O_NONBLOCK`) + a bounded
   poll that returns, so a failed run never wedges the entry.
-- The bridge is **~10× slower over the Lua entry** (~20 s/wave) than the native
-  chat-XSS transport (~2 s/wave), because each RPC parses request fields with
-  ~20 memmove-based reads. Attempts to speed the read path with direct `peek`
-  hard-crashed the console (an unexplained on-device interaction), so the slow
-  read path stands. Acquisition is correct over the bridge — just slow.
+- The bridge is **~10× slower** than a native transport (~20 s/wave), because each
+  RPC parses request fields with ~20 memmove-based reads. Attempts to speed the
+  read path with direct `peek` hard-crashed the console (an unexplained on-device
+  interaction), so the slow read path stands. Acquisition is correct over the
+  bridge — just slow.
+
+---
 
 ## Acquisition status
 
@@ -325,11 +321,8 @@ Gotchas that cost real time:
   ~20 s/wave it is a long haul to the `cache-*-leak` family where the canary
   finally lands, and recent runs stop before completing (a later host-specific
   constant, console degradation over a long run, or simply the clock).
-- **Over the native transport:** the race runs at full speed and reaches the
-  **final `cache-combined-leak` phase (~257 waves)** — the deepest point this
-  line of work has reached — but has been cut short by run-time caps and by the
-  console degrading after a long race (needs a reboot + re-arm between attempts;
-  the overwrite flips reliably only on the first run after a reboot).
+- The console degrades after a long race and needs a **reboot + re-arm between
+  attempts**; the overwrite flips reliably only on the first run after a reboot.
 - **Remaining:** finish the acquisition race (concurrent staggered worker threads
   landing a canary alloc in the freed reservation group during an in-flight large
   commit), then the standard, published post-acquisition escalation (arbitrary
@@ -337,12 +330,14 @@ Gotchas that cost real time:
   deterministic channel to drive all of it is complete; what's left is winning
   the race within a single healthy console session.
 
+---
+
 ## fs attack surface (RE direction)
 
 With code-exec in a process that talks to `fs`, the natural next question is where
 the *server-side* (privilege-boundary) bugs are. The nnSdk carries full symbols,
 and the client-side path-handling code is all present and named — the same bug
-class ns2jb abuses:
+class the upstream `ns2jb` work abuses:
 
 - `nn::fs::PathNormalizer::Normalize` (the core normalizer)
 - `nn::fs::PathNormalizer::IsParentDirectoryPathReplacementNeeded` (the `..`
@@ -360,21 +355,24 @@ a **package2 KIP** (kernel-loaded alongside `ldr`/`ncm`/`pm`/`sm`), *not* an
 exefs/NCA title — so it isn't present in a decoded exefs set and has to come from
 the KIP/package2 region specifically.
 
-*(This write-up covers exploitation technique and RE direction only. It contains
-no firmware images, no keys or keysets, and no device-specific material.)*
+---
 
-### Note on the CivSwitch (chat-XSS) sibling path
+## Status summary
 
-The CivSwitch/Civ 7 engine reaches the acquisition race and the overwrite
-primitive qualifies (with the right fill-segment constant), but its cache-alias
-*leak* currently returns 0 native-pointer candidates: the over-read lands on
-Civ 7's **encrypted/compressed save-data cache** (entropy ~7.0–7.9 bits/byte),
-not native allocator pages. Moving the alias offset only breaks alias selection;
-it doesn't relocate the leak. Retargeting *what* memory the cache-alias maps to
-(so the over-read lands on plaintext native-FS metadata) is the real crux there —
-and is exactly what the deterministic Seedsow channel sidesteps.
+- **Foothold:** deterministic `n2h` Lua code execution via `nora2hax/seedsow` on
+  fw 23.0.1. ✅
+- **Thread creation:** raw-svc kernel threads, HW-proven, with a block-capable
+  context. ✅
+- **IPC transport:** blocking, authenticated fsp-srv CMIF round-trips on a real
+  thread, with reply parsing and multi-command sessions. ✅
+- **Filesystem:** real IStorage opened, handle extracted, `GetSize` read back. ✅
+- **Concurrency:** truly-concurrent raw-svc worker threads for the race. ✅
+- **Acquisition race:** drives end-to-end over the bridge, reaches qualify +
+  races, not yet completed in recent runs. ⏳
+- **Post-acquisition escalation:** the published method; the deterministic
+  channel to drive it is complete. ⏳
 
 ---
 
-*Credits to the upstream scene projects: `nora2hax/seedsow`, the `ns2jb` fs-bug
-work, and the CivSwitch effort. Posted as research notes.*
+*Credits to the upstream scene projects: `nora2hax/seedsow` and the `ns2jb`
+fs-bug work. Posted as research notes.*
